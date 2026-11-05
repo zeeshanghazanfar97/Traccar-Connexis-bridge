@@ -68,10 +68,15 @@ def main():
             if args.once or args.dry_run:
                 operation = f"polling and updating state database {config.state_path}"
                 return 0 if bridge.poll(dry_run=args.dry_run) else 1
-            LOG.info("Connexis adapter started; poll interval %.1fs, API limit %d requests/minute, input speed unit %s",
-                     config.poll_interval, config.requests_per_minute, config.speed_unit)
-            delay = config.poll_interval
+            LOG.info(
+                "Connexis adapter started; API limit %d requests/minute, request spacing %.2fs, "
+                "calculated poll interval %.2fs (%d API requests/cycle), input speed unit %s",
+                config.requests_per_minute, config.request_interval, config.poll_interval,
+                config.requests_per_poll, config.speed_unit,
+            )
+            retry_delay = config.poll_interval
             while not stop.is_set():
+                cycle_started = time.monotonic()
                 try:
                     operation = f"polling and updating state database {config.state_path}"
                     success = bridge.poll()
@@ -81,9 +86,13 @@ def main():
                 if success:
                     operation = f"writing health marker {config.health_path}"
                     write_health(config.health_path)
-                    delay = config.poll_interval
+                    retry_delay = config.poll_interval
+                    # Account for HTTP work and pacing already spent in this cycle.
+                    # Do not sleep for another full cycle after its requests finish.
+                    delay = max(0.0, config.poll_interval - (time.monotonic() - cycle_started))
                 else:
-                    delay = min(delay * 2, config.max_backoff)
+                    retry_delay = min(retry_delay * 2, config.max_backoff)
+                    delay = retry_delay
                     LOG.warning("Retrying in %.1f seconds", delay)
                 stop.wait(delay)
             LOG.info("Adapter stopped")

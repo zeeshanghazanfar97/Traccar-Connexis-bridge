@@ -113,13 +113,27 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(Config.from_env(self.env()).requests_per_minute, 3)
         self.assertEqual(Config.from_env(self.env(CONNEXIS_REQUESTS_PER_MINUTE="12")).requests_per_minute, 12)
 
+    def test_polling_is_calculated_from_rate_and_discovery_mode(self):
+        for limit, plates, spacing, cycle in [(3, "", 20, 40), (3, "APL-04", 20, 20),
+                                             (6, "", 10, 20), (1, "", 60, 120),
+                                             (3, "APL-04,B-2", 20, 20)]:
+            with self.subTest(limit=limit, plates=plates):
+                config = Config.from_env(self.env(CONNEXIS_REQUESTS_PER_MINUTE=str(limit), CONNEXIS_PLATES=plates))
+                self.assertEqual(config.request_interval, spacing)
+                self.assertEqual(config.poll_interval, cycle)
+
+    def test_legacy_poll_interval_cannot_override_the_calculated_schedule(self):
+        for old_interval in ["1", "600", "invalid"]:
+            with self.subTest(old_interval=old_interval):
+                self.assertEqual(Config.from_env(self.env(POLL_INTERVAL=old_interval)).poll_interval, 40)
+
     def test_request_limit_requires_a_positive_integer(self):
         for value in ["0", "-1", "3.5", "nan", "inf", "", "false"]:
             with self.subTest(value=value), self.assertRaisesRegex(ValueError, "CONNEXIS_REQUESTS_PER_MINUTE"):
                 Config.from_env(self.env(CONNEXIS_REQUESTS_PER_MINUTE=value))
 
     def test_invalid_configuration_fails_at_startup(self):
-        for changes in [{"POLL_INTERVAL": "0"}, {"REQUEST_TIMEOUT": "nan"}, {"GPS_UTC_OFFSET": "+05:99"},
+        for changes in [{"REQUEST_TIMEOUT": "nan"}, {"GPS_UTC_OFFSET": "+05:99"},
                         {"VERIFY_TLS": "maybe"}, {"SPEED_UNIT": "kph"}, {"CONNEXIS_API_TOKEN": "bad\nvalue"},
                         {"CONNEXIS_BASE_URL": "https://user:password@example.com"},
                         {"CONNEXIS_ASSETS_PATH": "//other.example"}, {"MAX_BACKOFF": "1"}]:
@@ -220,7 +234,7 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(len(timestamps), 2)
 
     def test_provider_schema_errors_are_safe(self):
-        provider = ConnexisClient(self.config, self.state)
+        provider = ConnexisClient(replace(self.config, requests_per_minute=60000), self.state)
         provider.http = Mock()
         for body in [b"not json secret", b'{"status":401,"error":"secret"}', b'{"status":200,"data":{}}']:
             provider.http.request.return_value = body
@@ -259,6 +273,23 @@ class FakeClock:
         return False
 
 
+class FakeStop:
+    def __init__(self, clock):
+        self.clock = clock
+        self.stopped = False
+
+    def is_set(self):
+        return self.stopped
+
+    def set(self):
+        self.stopped = True
+
+    def wait(self, delay):
+        if not self.stopped:
+            self.clock.wait(delay)
+        return self.stopped
+
+
 class RateLimitTests(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
@@ -267,7 +298,8 @@ class RateLimitTests(unittest.TestCase):
         self.state = StateStore(self.path)
         self.addCleanup(lambda: self.state.close())
         self.clock = FakeClock()
-        self.limiter = RequestLimiter(self.state, 3, clock=self.clock.time, wait=self.clock.wait)
+        # Exercise the rolling quota independently of normal even pacing.
+        self.limiter = RequestLimiter(self.state, 3, clock=self.clock.time, wait=self.clock.wait, pace=False)
 
     def test_only_three_attempts_fit_in_each_rolling_minute(self):
         attempts = []
@@ -306,7 +338,7 @@ class RateLimitTests(unittest.TestCase):
         self.state.close()
         self.state = StateStore(self.path)
         self.clock.now += 10
-        restarted = RequestLimiter(self.state, 3, clock=self.clock.time, wait=self.clock.wait)
+        restarted = RequestLimiter(self.state, 3, clock=self.clock.time, wait=self.clock.wait, pace=False)
         restarted.acquire()
         self.assertEqual(self.clock.waits, [50])
 
@@ -329,13 +361,13 @@ class RateLimitTests(unittest.TestCase):
         for _ in range(3):
             self.limiter.acquire()
             self.clock.now += 10
-        lower = RequestLimiter(self.state, 1, clock=self.clock.time, wait=self.clock.wait)
+        lower = RequestLimiter(self.state, 1, clock=self.clock.time, wait=self.clock.wait, pace=False)
         lower.acquire()
         self.assertEqual(self.clock.now, 1080)
         self.assertEqual(self.clock.waits, [50])
 
     def test_higher_configured_limit_is_respected(self):
-        limiter = RequestLimiter(self.state, 5, clock=self.clock.time, wait=self.clock.wait)
+        limiter = RequestLimiter(self.state, 5, clock=self.clock.time, wait=self.clock.wait, pace=False)
         for _ in range(5):
             limiter.acquire()
         self.assertEqual(self.clock.waits, [])
@@ -367,6 +399,118 @@ class RateLimitTests(unittest.TestCase):
         with self.assertRaises(StopRequested):
             self.limiter.acquire()
         self.assertEqual(self.state.connection.execute("SELECT COUNT(*) FROM api_requests").fetchone()[0], 0)
+
+
+class PacingTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.path = Path(directory.name) / "state.sqlite3"
+        self.state = StateStore(self.path)
+        self.addCleanup(self.state.close)
+        self.clock = FakeClock()
+
+    def test_default_pacing_spaces_requests_evenly_without_info_level_warnings(self):
+        limiter = RequestLimiter(self.state, 3, clock=self.clock.time, wait=self.clock.wait)
+        attempts = []
+        with patch("adapter.bridge.LOG") as logger:
+            for _ in range(6):
+                limiter.acquire()
+                attempts.append(self.clock.now)
+            logger.info.assert_not_called()
+        self.assertEqual(attempts, [1000, 1020, 1040, 1060, 1080, 1100])
+
+    def test_pacing_survives_new_client_connections(self):
+        RequestLimiter(self.state, 3, clock=self.clock.time, wait=self.clock.wait).acquire()
+        self.clock.now += 5
+        other_state = StateStore(self.path)
+        try:
+            RequestLimiter(other_state, 3, clock=self.clock.time, wait=self.clock.wait).acquire()
+        finally:
+            other_state.close()
+        self.assertEqual(self.clock.waits, [15])
+
+    def test_old_burst_history_is_respected_when_upgrading_to_pacing(self):
+        for _ in range(3):
+            self.assertEqual(self.state.reserve_api_request(3, self.clock.now), 0)
+        self.clock.now += 5
+        RequestLimiter(self.state, 3, clock=self.clock.time, wait=self.clock.wait).acquire()
+        self.assertEqual(self.clock.waits, [55])
+
+
+class PollSchedulingTests(unittest.TestCase):
+    def test_real_poll_loop_paces_all_provider_requests_without_double_sleeping(self):
+        for plates in [(), ("APL-04",), ("APL-04", "B-2")]:
+            with self.subTest(plates=plates), tempfile.TemporaryDirectory() as directory:
+                clock = FakeClock()
+                stop = FakeStop(clock)
+                config = Config(base_url="https://provider.example", api_token="test-token", plates=plates,
+                                state_path=Path(directory) / "state.sqlite3", health_path=Path(directory) / "health")
+                calls = []
+                location_count = 0
+
+                def request(url, **kwargs):
+                    nonlocal location_count
+                    if url.startswith(config.base_url):
+                        calls.append((url, clock.now))
+                        clock.now += 3  # Simulate HTTP latency to catch double-sleep regressions.
+                        if url.endswith(config.locations_path):
+                            location_count += 1
+                            if location_count == 5:
+                                stop.set()
+                            return json.dumps({"status": 200, "data": [sample()]}).encode()
+                        return b'{"status":200,"data":["APL-04"]}'
+                    return b"OK"  # Traccar acknowledgment; repeated samples are deduplicated.
+
+                def limiter(state, limit, event):
+                    return RequestLimiter(state, limit, event, clock=clock.time, wait=stop.wait)
+
+                with patch("sys.argv", ["adapter"]), \
+                        patch("adapter.__main__.Config.from_env", return_value=config), \
+                        patch("adapter.__main__.signal.signal"), \
+                        patch("adapter.__main__.threading.Event", return_value=stop), \
+                        patch("adapter.__main__.time.monotonic", side_effect=clock.time), \
+                        patch("adapter.bridge.RequestLimiter", side_effect=limiter), \
+                        patch("adapter.bridge.HttpClient.request", side_effect=request), \
+                        self.assertLogs(level="INFO") as logs:
+                    self.assertEqual(main(), 0)
+                attempts = [at for _, at in calls]
+                self.assertEqual(len(attempts), 5 if plates else 10)
+                self.assertEqual(attempts, [1000 + 20 * index for index in range(len(attempts))])
+                for now in attempts:
+                    self.assertLessEqual(sum(now - 60 < at <= now for at in attempts), 3)
+                messages = "\n".join(logs.output)
+                self.assertIn(f"calculated poll interval {config.poll_interval:.2f}s", messages)
+                self.assertNotIn("request limit reached", messages)
+
+    def test_failure_backoff_is_capped_and_resets_after_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            clock = FakeClock()
+            stop = FakeStop(clock)
+            config = Config(base_url="https://provider.example", api_token="test-token", plates=("APL-04",),
+                            max_backoff=60, state_path=Path(directory) / "state.sqlite3",
+                            health_path=Path(directory) / "health")
+            outcomes = iter([False, False, True, False, True])
+            count = 0
+
+            def poll():
+                nonlocal count
+                count += 1
+                if count == 5:
+                    stop.set()
+                return next(outcomes)
+
+            bridge = Mock()
+            bridge.poll.side_effect = poll
+            with patch("sys.argv", ["adapter"]), \
+                    patch("adapter.__main__.Config.from_env", return_value=config), \
+                    patch("adapter.__main__.signal.signal"), \
+                    patch("adapter.__main__.threading.Event", return_value=stop), \
+                    patch("adapter.__main__.time.monotonic", side_effect=clock.time), \
+                    patch("adapter.__main__.Bridge", return_value=bridge), \
+                    self.assertLogs(level="INFO"):
+                self.assertEqual(main(), 0)
+            self.assertEqual(clock.waits, [40, 60, 20, 40])
 
 
 class HttpIntegrationTests(unittest.TestCase):

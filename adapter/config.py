@@ -72,7 +72,6 @@ class Config:
     assets_path: str = "/api/v1/assets/"
     locations_path: str = "/api/v1/current_location"
     plates: tuple = ()
-    poll_interval: float = 15
     requests_per_minute: int = 3
     max_backoff: float = 300
     request_timeout: float = 20
@@ -83,6 +82,19 @@ class Config:
     state_path: Path = Path("/data/state.sqlite3")
     health_path: Path = Path("/tmp/adapter-health")
     health_max_age: float = 600
+
+    @property
+    def request_interval(self):
+        return 60.0 / self.requests_per_minute
+
+    @property
+    def requests_per_poll(self):
+        return 1 if self.plates else 2
+
+    @property
+    def poll_interval(self):
+        # Location requests batch all selected vehicles in a single API call.
+        return self.requests_per_poll * self.request_interval
 
     @classmethod
     def from_env(cls, env=None):
@@ -104,18 +116,14 @@ class Config:
         speed_unit = env.get("SPEED_UNIT", "kmh").lower()
         if speed_unit not in {"kmh", "mph", "mps", "knots"}:
             raise ValueError("SPEED_UNIT must be kmh, mph, mps, or knots")
-        interval = positive_number(env.get("POLL_INTERVAL", "15"), "POLL_INTERVAL")
         backoff = positive_number(env.get("MAX_BACKOFF", "300"), "MAX_BACKOFF")
-        if backoff < interval:
-            raise ValueError("MAX_BACKOFF must be at least POLL_INTERVAL")
-        return cls(
+        config = cls(
             base_url=validate_url(env.get("CONNEXIS_BASE_URL", ""), "CONNEXIS_BASE_URL"),
             api_token=token,
             traccar_url=validate_url(env.get("TRACCAR_URL", "http://traccar:5055"), "TRACCAR_URL"),
             assets_path=paths["CONNEXIS_ASSETS_PATH"],
             locations_path=paths["CONNEXIS_LOCATIONS_PATH"],
             plates=tuple(dict.fromkeys(p.strip() for p in env.get("CONNEXIS_PLATES", "").split(",") if p.strip())),
-            poll_interval=interval,
             requests_per_minute=positive_integer(
                 env.get("CONNEXIS_REQUESTS_PER_MINUTE", "3"), "CONNEXIS_REQUESTS_PER_MINUTE"
             ),
@@ -129,3 +137,8 @@ class Config:
             health_path=Path(env.get("HEALTH_PATH", "/tmp/adapter-health")),
             health_max_age=positive_number(env.get("HEALTH_MAX_AGE", "600"), "HEALTH_MAX_AGE"),
         )
+        if backoff < config.poll_interval:
+            raise ValueError(
+                f"MAX_BACKOFF must be at least the calculated poll interval ({config.poll_interval:.1f}s)"
+            )
+        return config

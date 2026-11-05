@@ -29,21 +29,23 @@ class StopRequested(Exception):
 
 
 class RequestLimiter:
-    """Share a rolling 60-second request quota through the adapter state database."""
+    """Pace requests and share a rolling quota through the adapter state database."""
 
-    def __init__(self, state, limit, stop_event=None, *, clock=time.time, wait=None):
+    def __init__(self, state, limit, stop_event=None, *, clock=time.time, wait=None, pace=True):
         self.state = state
         self.limit = limit
+        self.minimum_interval = 60.0 / limit if pace else 0
         self.stop_event = stop_event if stop_event is not None else threading.Event()
         self.clock = clock
         self.wait = wait if wait is not None else self.stop_event.wait
 
     def acquire(self):
         while not self.stop_event.is_set():
-            delay = self.state.reserve_api_request(self.limit, self.clock())
+            delay = self.state.reserve_api_request(self.limit, self.clock(), self.minimum_interval)
             if delay <= 0:
                 return
-            LOG.info("Connexis request limit reached; waiting %.1f seconds", delay)
+            # Normal pacing is expected, including between discovery and locations.
+            LOG.debug("Waiting %.3f seconds for the next Connexis request slot", delay)
             if self.wait(delay):
                 break
         raise StopRequested
@@ -200,7 +202,7 @@ class StateStore:
         self.connection.execute("CREATE TABLE IF NOT EXISTS api_requests (requested_at REAL NOT NULL)")
         self.connection.commit()
 
-    def reserve_api_request(self, limit, now):
+    def reserve_api_request(self, limit, now, minimum_interval=0):
         # A write lock makes checking and reserving atomic across processes sharing
         # this volume, including --once/--list-assets and a restarted service.
         # Wall-clock timestamps survive restarts; an in-memory monotonic clock cannot.
@@ -210,9 +212,14 @@ class StateStore:
             timestamps = self.connection.execute(
                 "SELECT requested_at FROM api_requests ORDER BY requested_at"
             ).fetchall()
+            delay = 0
             if len(timestamps) >= limit:
                 # Also handles reducing the configured limit while requests remain.
-                return timestamps[len(timestamps) - limit][0] + 60 - now
+                delay = timestamps[len(timestamps) - limit][0] + 60 - now
+            if timestamps:
+                delay = max(delay, timestamps[-1][0] + minimum_interval - now)
+            if delay > 0:
+                return delay
             self.connection.execute("INSERT INTO api_requests (requested_at) VALUES (?)", (now,))
         return 0
 
