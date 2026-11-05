@@ -241,6 +241,19 @@ The tests include a local mock HTTP server and need permission to bind a loopbac
 
 For submission failures, check the exact Traccar device identifier and adapter logs. For provider errors, check its base URL, endpoint paths, authorization format, and TLS certificate. HTTP redirects are deliberately rejected so the authorization header cannot be forwarded elsewhere; configure the final API endpoint URL directly.
 
+If the adapter exits with a local I/O error before logging `Connexis adapter started`, inspect the mounted state folder first. The folder **and existing SQLite files** must be writable by UID/GID `10001:10001`. Earlier images logged only a generic I/O message; updated images include the failing operation and original exception.
+
+From your production Compose directory, repair adapter-state permissions and restart:
+
+```bash
+docker compose stop connexis-adapter
+sudo ./scripts/prepare-production.sh
+docker compose up -d
+docker compose logs --tail=50 -f connexis-adapter
+```
+
+Pass your custom `TRACCAR_VOLUME_ROOT` to the setup script if you changed it. The script now repairs existing adapter-state file ownership and permissions too. It leaves the PostgreSQL directory's existing permissions alone. This permission repair works with the already-published adapter image; improved error messages require rebuilding and publishing the updated code.
+
 A dry run that prints nothing can simply mean the latest fix is already in the state database. Avoid deleting state merely to make logs repeat.
 
 Reference sources: [Traccar Docker deployment](https://www.traccar.org/docker/), [configuration variables](https://www.traccar.org/configuration-file/), [OsmAnd protocol](https://www.traccar.org/osmand/), and [PostgreSQL/TimescaleDB setup](https://www.traccar.org/postgresql/).

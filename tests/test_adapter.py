@@ -6,14 +6,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
 from pathlib import Path
+import sqlite3
 import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from urllib.parse import parse_qs
 
-from adapter.__main__ import healthy, write_health
+from adapter.__main__ import healthy, main, write_health
 from adapter.bridge import (
     Bridge, BridgeError, ConnexisClient, HttpClient, RequestLimiter, StateStore,
     StopRequested, gps_timestamp, position_params,
@@ -124,6 +125,26 @@ class ConfigurationTests(unittest.TestCase):
                         {"CONNEXIS_ASSETS_PATH": "//other.example"}, {"MAX_BACKOFF": "1"}]:
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 Config.from_env(self.env(**changes))
+
+
+class StartupDiagnosticsTests(unittest.TestCase):
+    def test_state_failure_reports_operation_path_and_original_error(self):
+        config = Config(base_url="https://provider.example", api_token="private-token")
+        errors = [sqlite3.OperationalError("unable to open database file"),
+                  PermissionError(13, "Permission denied", "/data/state.sqlite3")]
+        for error in errors:
+            with self.subTest(error=type(error).__name__), \
+                    patch("sys.argv", ["adapter", "--once"]), \
+                    patch("adapter.__main__.Config.from_env", return_value=config), \
+                    patch("adapter.__main__.signal.signal"), \
+                    patch("adapter.__main__.StateStore", side_effect=error), \
+                    self.assertLogs("adapter", level="ERROR") as logs:
+                self.assertEqual(main(), 1)
+            message = "\n".join(logs.output)
+            self.assertIn("opening state database /data/state.sqlite3", message)
+            self.assertIn(type(error).__name__, message)
+            self.assertIn(str(error), message)
+            self.assertNotIn(config.api_token, message)
 
 
 class BridgeTests(unittest.TestCase):

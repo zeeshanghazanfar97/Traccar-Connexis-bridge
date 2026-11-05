@@ -40,6 +40,7 @@ def main():
     modes.add_argument("--healthcheck", action="store_true", help="Check freshness of the last successful poll")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    operation = "initializing the adapter"
     try:
         if args.healthcheck:
             return 0 if healthy(Path(os.getenv("HEALTH_PATH", "/tmp/adapter-health")),
@@ -52,25 +53,33 @@ def main():
             signal.signal(sig, lambda _signum, _frame: stop.set())
         # One-shot commands must not alter the running service's health marker.
         if not (args.once or args.dry_run or args.list_assets):
+            operation = f"clearing health marker {config.health_path}"
             config.health_path.unlink(missing_ok=True)
+        operation = f"opening state database {config.state_path}"
         state = StateStore(config.state_path)
         try:
+            operation = "initializing HTTP/TLS clients"
             if args.list_assets:
-                print(json.dumps(ConnexisClient(config, state, stop).assets(), indent=2))
+                provider = ConnexisClient(config, state, stop)
+                operation = f"discovering vehicles and updating request quota in {config.state_path}"
+                print(json.dumps(provider.assets(), indent=2))
                 return 0
             bridge = Bridge(config, state, stop)
             if args.once or args.dry_run:
+                operation = f"polling and updating state database {config.state_path}"
                 return 0 if bridge.poll(dry_run=args.dry_run) else 1
             LOG.info("Connexis adapter started; poll interval %.1fs, API limit %d requests/minute, input speed unit %s",
                      config.poll_interval, config.requests_per_minute, config.speed_unit)
             delay = config.poll_interval
             while not stop.is_set():
                 try:
+                    operation = f"polling and updating state database {config.state_path}"
                     success = bridge.poll()
                 except BridgeError as exc:
                     LOG.error("Polling failed: %s", exc)
                     success = False
                 if success:
+                    operation = f"writing health marker {config.health_path}"
                     write_health(config.health_path)
                     delay = config.poll_interval
                 else:
@@ -87,8 +96,8 @@ def main():
     except (ValueError, BridgeError) as exc:
         LOG.error("%s", exc)
         return 1
-    except (OSError, sqlite3.Error):
-        LOG.error("Local I/O failure; check state-volume permissions, available disk space, and CA file")
+    except (OSError, sqlite3.Error) as exc:
+        LOG.error("Local I/O failure while %s (%s): %s", operation, type(exc).__name__, exc)
         return 1
 
 
