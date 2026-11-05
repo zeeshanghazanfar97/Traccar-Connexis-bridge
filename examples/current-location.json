@@ -1,0 +1,17 @@
+{
+  "status": 200,
+  "data": [
+    {
+      "plateNo": "APL-04",
+      "latitude": 24.8607,
+      "longitude": 67.0011,
+      "gpsTime": "2026-11-05 08:19:09",
+      "speed": 18.52,
+      "io": [
+        {"ioName": "IGNITION", "ioValue": 1},
+        {"ioName": "MAIN POWER", "ioValue": 12.8},
+        {"ioName": "GSM SIGNAL", "ioValue": 4}
+      ]
+    }
+  ]
+}
