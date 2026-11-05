@@ -107,11 +107,7 @@ services:
       HEALTH_PATH: /tmp/adapter-health
       HEALTH_MAX_AGE: ${HEALTH_MAX_AGE:-600}
     volumes:
-      - type: bind
-        source: ${TRACCAR_VOLUME_ROOT:-/home/zeeshan/containers/volumes/traccar}/adapter-state
-        target: /data
-        bind:
-          create_host_path: false
+      - adapter_state:/data
     labels:
       traefik.enable: "false"
     read_only: true
@@ -132,3 +128,6 @@ services:
 networks:
   traefik-public:
     external: true
+
+volumes:
+  adapter_state:

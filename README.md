@@ -21,7 +21,7 @@ The implementation follows the API contract in your attached guide. The live Con
 | `Dockerfile` | Standard-library-only Python 3.12 adapter, running as a non-root user. |
 | `.env.example` | API credentials, Docker Hub namespace, release tag, and runtime options. |
 | `scripts/build-and-push.sh` | Builds and publishes the adapter image referenced by production Compose. |
-| `scripts/prepare-production.sh` | Creates production data folders and sets ownership for the non-root adapter. Run on the Docker host. |
+| `scripts/prepare-production.sh` | Creates production host folders for the database and Traccar. Adapter storage is managed by Docker. Run on the Docker host. |
 | `adapter/` | API client, data mapping, persistent delivery state, polling, and health check. |
 | `tests/` | Unit and mock HTTP integration tests. |
 
@@ -129,16 +129,17 @@ Traefik must already be attached to `traefik-public`, with this entrypoint, reso
 
 No service publishes host ports. Only Traccar joins `traefik-public`; the database and adapter communicate with it on the stack's default network. The adapter calls the internal GPS receiver directly, so its submissions do not pass through Authentik.
 
-All persistent production data is bind-mounted beneath `TRACCAR_VOLUME_ROOT`, defaulting to `/home/zeeshan/containers/volumes/traccar`:
+The database and Traccar's files are bind-mounted beneath `TRACCAR_VOLUME_ROOT`, defaulting to `/home/zeeshan/containers/volumes/traccar`:
 
 | Subfolder | Container path | Data |
 | --- | --- | --- |
 | `database` | `/var/lib/postgresql/data` | PostgreSQL/TimescaleDB database |
 | `logs` | `/opt/traccar/logs` | Traccar logs |
 | `data` | `/opt/traccar/data` | Traccar data files |
-| `adapter-state` | `/data` | Delivery timestamps and shared API request quota |
 
-Prepare these folders on the Docker host before deployment. The adapter runs as UID/GID `10001:10001`; its state folder must be writable by that user. Bind mounts require existing paths to prevent Docker from silently creating a root-owned adapter folder. Temporary adapter files remain in an in-memory `/tmp` mount.
+The adapter uses a **Docker-managed named volume**, `adapter_state`, mounted at `/data`. It has no host bind mounts. For a fresh volume, Docker initializes ownership from the image's `/data` directory, which belongs to UID/GID `10001:10001`. Delivery timestamps and the API request quota persist across restarts and container recreation. This is persistent Docker-managed disk storage; temporary adapter files use an in-memory `/tmp` mount.
+
+Prepare the three host folders above before deployment. No adapter-state host folder or manual ownership setup is needed for a fresh named volume.
 
 ```bash
 # Run on the production Docker host.
@@ -173,7 +174,36 @@ docker compose -p traccar -f compose.yml up -d --no-deps connexis-adapter
 
 Use a **Docker Standalone** Stack. Paste the complete `compose.yml` into its Web editor and supply the `.env.example` variables in Portainer's environment variable editor, replacing all placeholders. Portainer does not automatically read your workstation's `.env`.
 
-Publish the adapter first. Run the folder preparation script on the Docker host managed by Portainer, and verify that host has the existing `traefik-public` network. For a private image, configure Docker Hub registry credentials on the Portainer environment. Then deploy the stack, open Traccar through its HTTPS hostname, and register each device. The adapter code is in its image; only persistent data folders are mounted from the host. This configuration is for Compose/Standalone, not Docker Swarm.
+Publish the adapter first. Run the folder preparation script on the Docker host managed by Portainer, and verify that host has the existing `traefik-public` network. For a private image, configure Docker Hub registry credentials on the Portainer environment. Then deploy the stack, open Traccar through its HTTPS hostname, and register each device. The adapter code is in its image and its state is in a named volume; only database and Traccar folders are mounted from the host. This configuration is for Compose/Standalone, not Docker Swarm.
+
+### Switch an existing adapter from a bind mount
+
+Copy the updated `compose.yml` to your production Compose directory. This storage change does not require rebuilding or pushing the adapter image. Keep the same Compose project/Portainer stack name so subsequent deployments reuse the same named volume (`traccar_adapter_state` for project `traccar`).
+
+To preserve the existing delivery timestamps and request quota, stop the adapter and copy its old state into the fresh named volume before starting it:
+
+```bash
+docker compose stop connexis-adapter
+
+docker compose run --rm --no-deps --entrypoint sh \
+  --volume /home/zeeshan/containers/volumes/traccar/adapter-state:/legacy-state:ro \
+  connexis-adapter -c '
+    set -eu
+    test -f /legacy-state/state.sqlite3
+    if [ -n "$(ls -A /data)" ]; then
+      echo "Destination volume is not empty; refusing to overwrite existing state." >&2
+      exit 1
+    fi
+    cp -R /legacy-state/. /data/
+  '
+
+docker compose up -d --no-deps --force-recreate connexis-adapter
+docker compose logs --tail=50 -f connexis-adapter
+```
+
+Use your actual old folder path if it differs. The temporary read-only bind mount is used only by this migration command; the running adapter has no bind mounts. The old folder is left intact. Run the final startup commands only after migration succeeds. If the destination already contains state, inspect it before deciding which copy to use.
+
+You can skip migration if no old state needs preserving. A fresh named volume starts with an empty delivery history and API quota, so the latest position may be resent. Allow a full minute after stopping the old adapter before starting with fresh state to avoid overlapping the provider's previous request quota.
 
 ## API contract and mapping
 
@@ -202,7 +232,7 @@ Other IO fields are ignored. Missing speed defaults to zero. The guide supplies 
 - `CONNEXIS_REQUESTS_PER_MINUTE=3` is the default API limit. Set another positive integer in `.env` to match your provider's allowance; both Compose configurations pass it to the adapter. Requests are limited across all Connexis endpoints in a rolling 60-second window, and failed attempts count too. Traccar submissions do not consume this quota.
 - The request quota is stored with adapter state, so restarts and manual `--list-assets`, `--dry-run`, and `--once` commands using that same storage share the limit. Separate deployments or other applications using the same API account do not share this state; account for their traffic when choosing the limit.
 - `POLL_INTERVAL` remains the minimum pause between completed polling cycles. Rate-limit waits can make cycles take longer. Discovery plus current locations uses two API requests per cycle; set `CONNEXIS_PLATES` to skip discovery and use one. Shutdown interrupts a rate-limit wait promptly.
-- Duplicate and older timestamps are skipped per vehicle. SQLite state in the production `adapter-state` folder (development `adapter_state` volume) survives container restarts and updates. Delivery state advances only after an HTTP 200 acknowledgment from Traccar.
+- Duplicate and older timestamps are skipped per vehicle. SQLite state in the `adapter_state` named volume survives container restarts and updates in both production and development. Delivery state advances only after an HTTP 200 acknowledgment from Traccar.
 - Temporary failures retry with exponential backoff, capped by `MAX_BACKOFF`. A malformed vehicle does not prevent valid vehicles in the response from being processed. No provider response bodies or tokens are logged.
 - TLS verification is enabled. `VERIFY_TLS=false` affects Connexis only. For a private CA, mount the certificate read-only and set the adapter's `CONNEXIS_CA_FILE` to its container path through an additional Compose override.
 - Health checks measure the last successful polling/forwarding cycle, including successful duplicate-only or empty responses. They do **not** prove the tracker is supplying fresh GPS fixes. An unhealthy status alone does not trigger a Docker restart; retries continue internally.
@@ -214,9 +244,9 @@ Other IO fields are ignored. Missing speed defaults to zero. The guide supplies 
 
 ## Persistence and maintenance
 
-Production data lives in the four host folders under `TRACCAR_VOLUME_ROOT`. Keep this path stable when redeploying. Docker Compose teardown does not delete bind-mounted host data. Development uses named volumes: `docker compose down` preserves them, while **`down -v` deletes development data**.
+Production stores database and Traccar files in three host folders under `TRACCAR_VOLUME_ROOT`, and adapter state in the `adapter_state` named volume. Keep both the host path and Compose project/Portainer stack name stable when redeploying. `docker compose down` preserves the named volume; **`down -v` deletes adapter state in production**. Bind-mounted host data is retained. Development uses named volumes for all data, so `down -v` deletes all development data.
 
-If replacing the earlier production configuration that used named volumes, stop that stack and migrate its database, logs, Traccar data, and adapter state into the matching host folders before starting this configuration. Preserve file ownership during migration and retain the original volumes until the migrated data is verified. Empty host folders initialize a fresh installation.
+If migrating from the earliest production configuration that used named volumes for every service, migrate the database, logs, and Traccar data into their matching host folders. Adapter state can reuse the original `adapter_state` volume with the same project name. If the adapter currently uses a bind mount, follow the migration instructions above.
 
 The database image follows the guide's `timescale/timescaledb:latest-pg17` tag. For controlled upgrades, set `DATABASE_IMAGE` to a tested version or digest before deployment. Do not change the PostgreSQL major version against an existing data volume without a database migration. Changing `DB_PASSWORD` in `.env` does not change the password inside an already initialized database.
 
@@ -227,7 +257,7 @@ mkdir -p backups
 docker compose -p traccar -f compose.yml exec -T database pg_dump -U traccar -d traccar -Fc > backups/traccar.dump
 ```
 
-For a consistent adapter-state backup, stop the adapter and copy the `adapter-state` folder under `TRACCAR_VOLUME_ROOT`, then start it again. Preserve its ownership and permissions. Restore database history and adapter state from matching backups; restoring old history with newer adapter state can skip fixes.
+For a consistent adapter-state backup, stop the adapter and back up its `adapter_state` named volume with your Docker volume backup tooling, then start it again. Preserve its ownership and permissions. Restore database history and adapter state from matching backups; restoring old history with newer adapter state can skip fixes.
 
 ## Validation and troubleshooting
 
@@ -241,18 +271,7 @@ The tests include a local mock HTTP server and need permission to bind a loopbac
 
 For submission failures, check the exact Traccar device identifier and adapter logs. For provider errors, check its base URL, endpoint paths, authorization format, and TLS certificate. HTTP redirects are deliberately rejected so the authorization header cannot be forwarded elsewhere; configure the final API endpoint URL directly.
 
-If the adapter exits with a local I/O error before logging `Connexis adapter started`, inspect the mounted state folder first. The folder **and existing SQLite files** must be writable by UID/GID `10001:10001`. Earlier images logged only a generic I/O message; updated images include the failing operation and original exception.
-
-From your production Compose directory, repair adapter-state permissions and restart:
-
-```bash
-docker compose stop connexis-adapter
-sudo ./scripts/prepare-production.sh
-docker compose up -d
-docker compose logs --tail=50 -f connexis-adapter
-```
-
-Pass your custom `TRACCAR_VOLUME_ROOT` to the setup script if you changed it. The script now repairs existing adapter-state file ownership and permissions too. It leaves the PostgreSQL directory's existing permissions alone. This permission repair works with the already-published adapter image; improved error messages require rebuilding and publishing the updated code.
+If the adapter exits with a local I/O error before logging `Connexis adapter started`, inspect its `/data` mount. With the current configuration this must be a named volume, not the old host folder. Fresh volumes inherit the image's correct ownership; an existing or restored volume still needs its files writable by UID/GID `10001:10001`. The host setup script does not manage adapter volume contents. Earlier images logged only a generic I/O message; updated images include the failing operation and original exception.
 
 A dry run that prints nothing can simply mean the latest fix is already in the state database. Avoid deleting state merely to make logs repeat.
 
