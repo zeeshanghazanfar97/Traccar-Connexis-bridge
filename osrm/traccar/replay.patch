@@ -1,0 +1,45 @@
+--- a/src/other/ReplayPage.jsx
++++ b/src/other/ReplayPage.jsx
+@@ -23,6 +23,7 @@
+ import MapScale from '../map/MapScale';
+ import BackIcon from '../common/components/BackIcon';
+ import fetchOrThrow from '../common/util/fetchOrThrow';
++import { RoadMatchControl, RoadMatchLayer, useRoadMatch } from './osrm/RoadMatch';
+ import MapOverlay from '../map/overlay/MapOverlay';
+ 
+ const useStyles = makeStyles()((theme) => ({
+@@ -96,6 +97,9 @@
+ 
+   const loaded = Boolean(from && to && !loading && positions.length);
+ 
++  const [matchEnabled, setMatchEnabled] = useState(false);
++  const roadMatch = useRoadMatch(positions, loaded && matchEnabled);
++
+   const deviceName = useSelector((state) => {
+     if (selectedDeviceId) {
+       const device = state.devices.items[selectedDeviceId];
+@@ -149,6 +153,8 @@
+     async ({ deviceIds, from, to }) => {
+       const deviceId = deviceIds.find(() => true);
+       setLoading(true);
++      setPlaying(false);
++      setPositions([]);
+       setSelectedDeviceId(deviceId);
+       const query = new URLSearchParams({ deviceId, from, to });
+       try {
+@@ -178,6 +184,7 @@
+         <MapOverlay />
+         <MapGeofence />
+         <MapRoutePath positions={positions} />
++        {roadMatch.lines?.length > 0 && <RoadMatchLayer lines={roadMatch.lines} />}
+         <MapRoutePoints positions={positions} onClick={onPointClick} showSpeedControl />
+         {index < positions.length && (
+           <MapPositionMarkers
+@@ -216,6 +223,7 @@
+               <Typography variant="subtitle1" align="center">
+                 {deviceName}
+               </Typography>
++              <RoadMatchControl enabled={matchEnabled} onChange={setMatchEnabled} status={roadMatch.status} />
+               <Slider
+                 className={classes.slider}
+                 max={positions.length - 1}

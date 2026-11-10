@@ -12,11 +12,13 @@ Connexis API → Python adapter → Traccar :5055 → TimescaleDB
 
 The implementation follows the API contract in your attached guide. The live Connexis API has not been verified with your credentials. The sample responses in `examples/` are illustrative, not captured account data.
 
+Replay can display historical trips with a road-matched overlay using self-hosted OSRM and a Pakistan road graph. [Setup for development, Docker and Portainer](docs/osrm.md)
+
 ## Files
 
 | File | Purpose |
 | --- | --- |
-| `compose.yml` | Production stack. Pulls all three images, persists data in host folders, and routes the dashboard through Traefik without publishing ports. Can be pasted into Portainer. |
+| `compose.yml` | Production stack. Pulls service images, persists data in host folders, and routes the dashboard through Traefik without publishing ports. Can be pasted into Portainer. |
 | `compose.dev.yml` | Standalone development stack with named volumes and a localhost dashboard; builds the adapter as `traccar-connexis-adapter:dev`. |
 | `Dockerfile` | Standard-library-only Python 3.12 adapter, running as a non-root user. |
 | `.env.example` | API credentials, Docker Hub namespace, release tag, optional SMTP/SSO, and runtime options. |
@@ -175,7 +177,7 @@ docker compose -p traccar -f compose.yml up -d --no-deps connexis-adapter
 
 Use a **Docker Standalone** Stack. Paste the complete `compose.yml` into its Web editor and supply the `.env.example` variables in Portainer's environment variable editor, replacing all placeholders. Portainer does not automatically read your workstation's `.env`.
 
-Publish the adapter first. Run the folder preparation script on the Docker host managed by Portainer, and verify that host has the existing `traefik-public` network. For a private image, configure Docker Hub registry credentials on the Portainer environment. Then deploy the stack, open Traccar through its HTTPS hostname, and register each device. The adapter code is in its image and its state is in a named volume; only database and Traccar folders are mounted from the host. This configuration is for Compose/Standalone, not Docker Swarm.
+Publish the adapter first. Run the folder preparation script on the Docker host managed by Portainer, and verify that host has the existing `traefik-public` network. For a private image, configure Docker Hub registry credentials on the Portainer environment. Then deploy the stack, open Traccar through its HTTPS hostname, and register each device. The adapter code is in its image and its state is in a named volume. The optional OSRM service mounts its prepared road graph from the host. This configuration is for Compose/Standalone, not Docker Swarm.
 
 ### Switch an existing adapter from a bind mount
 
@@ -265,6 +267,8 @@ For a consistent adapter-state backup, stop the adapter and back up its `adapter
 
 ```bash
 python3 -m unittest discover -s tests -v
+# Replay batching and fallback tests (Node 22+).
+node --test tests/osrm-trace.test.mjs
 docker compose --env-file .env.example -f compose.yml config --quiet
 docker compose --env-file .env.example -f compose.dev.yml config --quiet
 ```
