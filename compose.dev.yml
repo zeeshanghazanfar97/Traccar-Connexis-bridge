@@ -27,6 +27,33 @@ services:
     image: ${TRACCAR_IMAGE:-traccar/traccar:6.17.0-alpine}
     pull_policy: missing
     restart: unless-stopped
+    # Keep this startup guard identical to production; blank keys must be absent.
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        if [ -z "$$MAIL_SMTP_HOST" ]; then
+          unset MAIL_SMTP_HOST
+        else
+          : "$${MAIL_SMTP_FROM:?Set SMTP_FROM when SMTP_HOST is set}"
+          if [ "$$MAIL_SMTP_SSL_ENABLE" = true ] && [ "$$MAIL_SMTP_STARTTLS_ENABLE" = true ]; then
+            echo 'Choose SMTP_STARTTLS=true or SMTP_SSL=true, not both.' >&2
+            exit 1
+          fi
+        fi
+        if [ -z "$$OPENID_CLIENT_ID" ]; then
+          if [ "$$OPENID_FORCE" = true ]; then
+            echo 'OPENID_FORCE=true requires a configured OPENID_CLIENT_ID.' >&2
+            exit 1
+          fi
+          unset OPENID_CLIENT_ID OPENID_CLIENT_SECRET OPENID_ISSUER_URL
+        else
+          : "$${OPENID_CLIENT_SECRET:?Set OPENID_CLIENT_SECRET when OPENID_CLIENT_ID is set}"
+          : "$${OPENID_ISSUER_URL:?Set OPENID_ISSUER_URL when OPENID_CLIENT_ID is set}"
+        fi
+        exec /opt/traccar/jre/bin/java -XX:+ExitOnOutOfMemoryError "$$@"
+      - traccar-start
+    command: ["-jar", "tracker-server.jar", "conf/traccar.xml"]
     depends_on:
       database:
         condition: service_healthy
@@ -41,6 +68,25 @@ services:
       OSMAND_SPEED: knots
       FILTER_DUPLICATE: "true"
       LOGGER_CONSOLE: "true"
+      WEB_URL: http://localhost:${TRACCAR_WEB_PORT:-8082}
+      MAIL_SMTP_HOST: ${SMTP_HOST:-}
+      MAIL_SMTP_PORT: ${SMTP_PORT:-587}
+      MAIL_SMTP_USERNAME: ${SMTP_USERNAME:-}
+      MAIL_SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      MAIL_SMTP_FROM: ${SMTP_FROM:-}
+      MAIL_SMTP_FROM_NAME: ${SMTP_FROM_NAME:-Traccar}
+      MAIL_SMTP_STARTTLS_ENABLE: ${SMTP_STARTTLS:-true}
+      MAIL_SMTP_STARTTLS_REQUIRED: ${SMTP_STARTTLS:-true}
+      MAIL_SMTP_SSL_ENABLE: ${SMTP_SSL:-false}
+      MAIL_SMTP_TIMEOUT: ${SMTP_TIMEOUT:-10000}
+      MAIL_SMTP_SYSTEM_ONLY: "false"
+      OPENID_CLIENT_ID: ${OPENID_CLIENT_ID:-}
+      OPENID_CLIENT_SECRET: ${OPENID_CLIENT_SECRET:-}
+      OPENID_ISSUER_URL: ${OPENID_ISSUER_URL:-}
+      OPENID_FORCE: ${OPENID_FORCE:-false}
+      OPENID_ALLOW_REGISTRATION: ${OPENID_ALLOW_REGISTRATION:-false}
+      OPENID_ALLOW_GROUP: ${OPENID_ALLOW_GROUP:-}
+      OPENID_ADMIN_GROUP: ${OPENID_ADMIN_GROUP:-}
     ports:
       - "${TRACCAR_BIND_ADDRESS:-127.0.0.1}:${TRACCAR_WEB_PORT:-8082}:8082"
     expose:

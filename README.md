@@ -19,7 +19,8 @@ The implementation follows the API contract in your attached guide. The live Con
 | `compose.yml` | Production stack. Pulls all three images, persists data in host folders, and routes the dashboard through Traefik without publishing ports. Can be pasted into Portainer. |
 | `compose.dev.yml` | Standalone development stack with named volumes and a localhost dashboard; builds the adapter as `traccar-connexis-adapter:dev`. |
 | `Dockerfile` | Standard-library-only Python 3.12 adapter, running as a non-root user. |
-| `.env.example` | API credentials, Docker Hub namespace, release tag, and runtime options. |
+| `.env.example` | API credentials, Docker Hub namespace, release tag, optional SMTP/SSO, and runtime options. |
+| `docs/notifications-and-sso.md` | Email delivery, report schedules, and native Authentik/OpenID Connect login setup. |
 | `scripts/build-and-push.sh` | Builds and publishes the adapter image referenced by production Compose. |
 | `scripts/prepare-production.sh` | Creates production host folders for the database and Traccar. Adapter storage is managed by Docker. Run on the Docker host. |
 | `adapter/` | API client, data mapping, persistent delivery state, polling, and health check. |
@@ -122,10 +123,10 @@ Production matches your existing Traefik setup:
 | External Docker network | `traefik-public` |
 | Entrypoint | `websecure` |
 | TLS certificate resolver | `cloudflare` |
-| Authentication middleware | `authentik@file` |
+| Authentication middleware | `authentik@file`, configurable with `TRACCAR_MIDDLEWARES` |
 | Internal dashboard destination | Traccar port `8082` over HTTP |
 
-Traefik must already be attached to `traefik-public`, with this entrypoint, resolver, and middleware configured. Point the dashboard hostname at your existing Traefik endpoint and configure Authentik for that hostname. Traccar also receives its public HTTPS URL through `WEB_URL`. Authentik protects access to the dashboard; you still create and use a Traccar account.
+Traefik must already be attached to `traefik-public`, with this entrypoint, resolver, and middleware configured. Point the dashboard hostname at your existing Traefik endpoint and configure Authentik for that hostname. Traccar also receives its public HTTPS URL through `WEB_URL`. By default, Authentik protects access to the dashboard and Traccar uses its own login. For native SSO and optional SMTP, follow [Email notifications, reports, and SSO](docs/notifications-and-sso.md).
 
 No service publishes host ports. Only Traccar joins `traefik-public`; the database and adapter communicate with it on the stack's default network. The adapter calls the internal GPS receiver directly, so its submissions do not pass through Authentik.
 
